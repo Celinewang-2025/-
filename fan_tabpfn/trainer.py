@@ -64,6 +64,57 @@ def compute_eta(psi, phi, lam):
     return eta
 
 
+def peak_from_curve(phi, eta):
+    """在离散 (φ, η) 曲线上求峰：最大点附近局部二次拟合取顶点，失败则退回离散最大点。"""
+    phi = np.asarray(phi, dtype=float)
+    eta = np.asarray(eta, dtype=float)
+    m = np.isfinite(phi) & np.isfinite(eta)
+    phi, eta = phi[m], eta[m]
+    if len(phi) == 0:
+        return float("nan"), float("nan")
+    order = np.argsort(phi)
+    phi, eta = phi[order], eta[order]
+    i = int(np.argmax(eta))
+    lo = max(0, i - 1)
+    hi = min(len(phi), i + 2)
+    pw, ew = phi[lo:hi], eta[lo:hi]
+    if len(pw) >= 3:
+        try:
+            a, b, c = np.polyfit(pw, ew, 2)
+            if a < 0:
+                phi_star = -b / (2.0 * a)
+                if pw.min() <= phi_star <= pw.max():
+                    eta_star = a * phi_star ** 2 + b * phi_star + c
+                    return float(eta_star), float(phi_star)
+        except Exception:
+            pass
+    return float(eta[i]), float(phi[i])
+
+
+def derive_scalars_from_curve(eta_curve, df, det):
+    """从预测 η 曲线对每台风扇求峰得到 η_max / φ_at_ηmax，并对齐真实列（自动处理百分数/分数单位）。"""
+    fans = list(pd.unique(eta_curve["__fan__"]))
+    etamax_col = det.get("eta_max")
+    phiat_col = det.get("phi_at_etamax")
+    has_id = "风扇ID" in df.columns
+    true_etamax = dict(zip(df["风扇ID"], df[etamax_col])) if (etamax_col and has_id) else {}
+    true_phiat = dict(zip(df["风扇ID"], df[phiat_col])) if (phiat_col and has_id) else {}
+    recs = []
+    for f in fans:
+        sub = eta_curve[eta_curve["__fan__"] == f]
+        eta_peak, phi_peak = peak_from_curve(sub["phi"].to_numpy(), sub["eta_pred"].to_numpy())
+        recs.append(dict(__fan__=f, etamax_pred_frac=eta_peak, phiat_pred=phi_peak,
+                         etamax_true=float(true_etamax.get(f, np.nan)) if etamax_col else np.nan,
+                         phiat_true=float(true_phiat.get(f, np.nan)) if phiat_col else np.nan))
+    der = pd.DataFrame(recs)
+    scale = 1.0
+    if etamax_col is not None and len(der) and np.isfinite(der["etamax_true"].to_numpy(dtype=float)).any():
+        if np.nanmedian(der["etamax_true"].to_numpy(dtype=float)) > 1.5:
+            scale = 100.0
+    der["etamax_pred"] = der["etamax_pred_frac"] * scale
+    return der
+
+
 def lofo_curve(long_df, feature_cols, target, device, log=print, cancel=None):
     """留一台风扇验证曲线目标（'psi' 或 'lam'），返回带预测列的结果表。"""
     if cancel is None:

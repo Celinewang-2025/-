@@ -215,6 +215,67 @@ def compute_eta(psi, phi, lam):
     return eta
 
 
+def peak_from_curve(phi, eta):
+    """
+    在离散的 (φ, η) 曲线上求峰值。
+    在离散最大点附近做局部二次拟合取顶点，得到更平滑的 η_max 与 φ_at_ηmax；
+    若拟合不可靠则退回离散最大点。
+    返回 (eta_peak, phi_peak)。
+    """
+    phi = np.asarray(phi, dtype=float)
+    eta = np.asarray(eta, dtype=float)
+    m = np.isfinite(phi) & np.isfinite(eta)
+    phi, eta = phi[m], eta[m]
+    if len(phi) == 0:
+        return np.nan, np.nan
+    order = np.argsort(phi)
+    phi, eta = phi[order], eta[order]
+    i = int(np.argmax(eta))
+    lo = max(0, i - 1)
+    hi = min(len(phi), i + 2)
+    pw, ew = phi[lo:hi], eta[lo:hi]
+    if len(pw) >= 3:
+        try:
+            a, b, c = np.polyfit(pw, ew, 2)
+            if a < 0:  # 凹，存在极大值
+                phi_star = -b / (2.0 * a)
+                if pw.min() <= phi_star <= pw.max():
+                    eta_star = a * phi_star ** 2 + b * phi_star + c
+                    return float(eta_star), float(phi_star)
+        except Exception:
+            pass
+    return float(eta[i]), float(phi[i])
+
+
+def derive_scalars_from_curve(eta_curve, df, det):
+    """
+    从（留一验证得到的）预测 η 曲线对每台风扇求峰，得到 η_max / φ_at_ηmax 的预测，
+    并对齐真实 η_max / φ_at_ηmax 列。自动处理 η_max 的百分数/分数单位差异。
+    """
+    fans = list(pd.unique(eta_curve["__fan__"]))
+    etamax_col = det.get("eta_max")
+    phiat_col = det.get("phi_at_etamax")
+    has_id = "风扇ID" in df.columns
+    true_etamax = dict(zip(df["风扇ID"], df[etamax_col])) if (etamax_col and has_id) else {}
+    true_phiat = dict(zip(df["风扇ID"], df[phiat_col])) if (phiat_col and has_id) else {}
+    recs = []
+    for f in fans:
+        sub = eta_curve[eta_curve["__fan__"] == f]
+        eta_peak, phi_peak = peak_from_curve(sub["phi"].to_numpy(), sub["eta_pred"].to_numpy())
+        recs.append(dict(__fan__=f, etamax_pred_frac=eta_peak, phiat_pred=phi_peak,
+                         etamax_true=float(true_etamax.get(f, np.nan)) if etamax_col else np.nan,
+                         phiat_true=float(true_phiat.get(f, np.nan)) if phiat_col else np.nan))
+    der = pd.DataFrame(recs)
+    # 单位对齐：若真实 η_max 是百分数(中位数>1.5)，把"分数"预测换算成百分数
+    scale = 1.0
+    if etamax_col is not None and len(der) and np.isfinite(der["etamax_true"].to_numpy(dtype=float)).any():
+        med = np.nanmedian(der["etamax_true"].to_numpy(dtype=float))
+        if med > 1.5:
+            scale = 100.0
+    der["etamax_pred"] = der["etamax_pred_frac"] * scale
+    return der
+
+
 def lofo_curve(long_df, feature_cols, target, device, log=print, cancel=None):
     """留一台风扇验证曲线目标（'psi' 或 'lam'），返回带预测列的结果表。"""
     if cancel is None:
@@ -351,23 +412,29 @@ class TrainWorker(QtCore.QThread):
                 results["eta_metrics"] = m
                 self.log.emit("η(由ψst·φ/λ计算) 指标: %s" % _fmt_metrics(m))
 
-            if self.targets.get("eta_max") and self.det.get("eta_max") and not self._cancel:
-                self.log.emit("===== 训练/验证 最大效率 η_max =====")
-                fan_ids, y, pred = lofo_scalar(self.df, self.feats, self.det["eta_max"],
-                                               self.device, log=self.log.emit, cancel=self._cancelled)
-                results["eta_max"] = dict(fan=fan_ids, y=y, pred=pred)
-                m = regression_metrics(y, pred)
-                results["eta_max_metrics"] = m
-                self.log.emit("η_max 指标: %s" % _fmt_metrics(m))
-
-            if self.targets.get("phi_at") and self.det.get("phi_at_etamax") and not self._cancel:
-                self.log.emit("===== 训练/验证 最大效率点流量系数 φ_at_ηmax =====")
-                fan_ids, y, pred = lofo_scalar(self.df, self.feats, self.det["phi_at_etamax"],
-                                               self.device, log=self.log.emit, cancel=self._cancelled)
-                results["phi_at"] = dict(fan=fan_ids, y=y, pred=pred)
-                m = regression_metrics(y, pred)
-                results["phi_at_metrics"] = m
-                self.log.emit("φ_at_ηmax 指标: %s" % _fmt_metrics(m))
+            # η_max / φ_at_ηmax 改为从预测的 η 曲线求峰得到（比单独训标量更准，且与曲线自洽）
+            need_scalar = self.targets.get("eta_max") or self.targets.get("phi_at")
+            if need_scalar and not self._cancel:
+                if results.get("eta_curve") is None:
+                    self.log.emit("提示：η_max / φ_at_ηmax 现在由预测 η 曲线求峰得到，需要同时勾选 ψst 和 λ。已跳过。")
+                else:
+                    self.log.emit("===== 由预测 η 曲线求峰得到 η_max / φ_at_ηmax =====")
+                    der = derive_scalars_from_curve(results["eta_curve"], self.df, self.det)
+                    results["scalar_from_curve"] = der
+                    if self.targets.get("eta_max") and self.det.get("eta_max"):
+                        m = regression_metrics(der["etamax_true"].to_numpy(dtype=float),
+                                               der["etamax_pred"].to_numpy(dtype=float))
+                        results["eta_max"] = dict(fan=der["__fan__"], y=der["etamax_true"].to_numpy(dtype=float),
+                                                  pred=der["etamax_pred"].to_numpy(dtype=float))
+                        results["eta_max_metrics"] = m
+                        self.log.emit("η_max(由η曲线求峰) 指标: %s" % _fmt_metrics(m))
+                    if self.targets.get("phi_at") and self.det.get("phi_at_etamax"):
+                        m = regression_metrics(der["phiat_true"].to_numpy(dtype=float),
+                                               der["phiat_pred"].to_numpy(dtype=float))
+                        results["phi_at"] = dict(fan=der["__fan__"], y=der["phiat_true"].to_numpy(dtype=float),
+                                                 pred=der["phiat_pred"].to_numpy(dtype=float))
+                        results["phi_at_metrics"] = m
+                        self.log.emit("φ_at_ηmax(由η曲线求峰) 指标: %s" % _fmt_metrics(m))
 
             self.finished_ok.emit(results)
         except Exception:
@@ -665,12 +732,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.chk_lam.isChecked():
                 bundle["models"]["lam"] = fit_curve_final(long_df, self.feats, "lam", device)
                 self.log("λ 最终模型完成")
-            if self.chk_etamax.isChecked() and self.det.get("eta_max"):
-                bundle["models"]["eta_max"] = fit_scalar_final(self.df, self.feats, self.det["eta_max"], device)
-                self.log("η_max 最终模型完成")
-            if self.chk_phiat.isChecked() and self.det.get("phi_at_etamax"):
-                bundle["models"]["phi_at"] = fit_scalar_final(self.df, self.feats, self.det["phi_at_etamax"], device)
-                self.log("φ_at_ηmax 最终模型完成")
+            if self.chk_etamax.isChecked() or self.chk_phiat.isChecked():
+                bundle["scalar_from_curve"] = True
+                self.log("注：η_max / φ_at_ηmax 由预测 η 曲线求峰得到，无需单独保存标量模型。")
             joblib.dump(bundle, path)
             self.log("最终模型已保存：%s" % path)
         except Exception:

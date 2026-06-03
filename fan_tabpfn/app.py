@@ -103,23 +103,29 @@ class TrainWorker(QtCore.QThread):
                 results["eta_metrics"] = m
                 self.log.emit("η(由ψst·φ/λ计算) 指标: %s" % _fmt_metrics(m))
 
-            if self.targets.get("eta_max") and self.det.get("eta_max") and not self._cancel:
-                self.log.emit("===== 训练/验证 最大效率 η_max =====")
-                fan_ids, y, pred = tr.lofo_scalar(self.df, self.feats, self.det["eta_max"],
-                                                  self.device, log=self.log.emit, cancel=self._cancelled)
-                results["eta_max"] = dict(fan=fan_ids, y=y, pred=pred)
-                m = tr.regression_metrics(y, pred)
-                results["eta_max_metrics"] = m
-                self.log.emit("η_max 指标: %s" % _fmt_metrics(m))
-
-            if self.targets.get("phi_at") and self.det.get("phi_at_etamax") and not self._cancel:
-                self.log.emit("===== 训练/验证 最大效率点流量系数 φ_at_ηmax =====")
-                fan_ids, y, pred = tr.lofo_scalar(self.df, self.feats, self.det["phi_at_etamax"],
-                                                  self.device, log=self.log.emit, cancel=self._cancelled)
-                results["phi_at"] = dict(fan=fan_ids, y=y, pred=pred)
-                m = tr.regression_metrics(y, pred)
-                results["phi_at_metrics"] = m
-                self.log.emit("φ_at_ηmax 指标: %s" % _fmt_metrics(m))
+            # η_max / φ_at_ηmax 改为从预测的 η 曲线求峰得到（比单独训标量更准，且与曲线自洽）
+            need_scalar = self.targets.get("eta_max") or self.targets.get("phi_at")
+            if need_scalar and not self._cancel:
+                if results.get("eta_curve") is None:
+                    self.log.emit("提示：η_max / φ_at_ηmax 现在由预测 η 曲线求峰得到，需要同时勾选 ψst 和 λ。已跳过。")
+                else:
+                    self.log.emit("===== 由预测 η 曲线求峰得到 η_max / φ_at_ηmax =====")
+                    der = tr.derive_scalars_from_curve(results["eta_curve"], self.df, self.det)
+                    results["scalar_from_curve"] = der
+                    if self.targets.get("eta_max") and self.det.get("eta_max"):
+                        m = tr.regression_metrics(der["etamax_true"].to_numpy(dtype=float),
+                                                  der["etamax_pred"].to_numpy(dtype=float))
+                        results["eta_max"] = dict(fan=der["__fan__"], y=der["etamax_true"].to_numpy(dtype=float),
+                                                  pred=der["etamax_pred"].to_numpy(dtype=float))
+                        results["eta_max_metrics"] = m
+                        self.log.emit("η_max(由η曲线求峰) 指标: %s" % _fmt_metrics(m))
+                    if self.targets.get("phi_at") and self.det.get("phi_at_etamax"):
+                        m = tr.regression_metrics(der["phiat_true"].to_numpy(dtype=float),
+                                                  der["phiat_pred"].to_numpy(dtype=float))
+                        results["phi_at"] = dict(fan=der["__fan__"], y=der["phiat_true"].to_numpy(dtype=float),
+                                                 pred=der["phiat_pred"].to_numpy(dtype=float))
+                        results["phi_at_metrics"] = m
+                        self.log.emit("φ_at_ηmax(由η曲线求峰) 指标: %s" % _fmt_metrics(m))
 
             self.finished_ok.emit(results)
         except Exception:
@@ -433,12 +439,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.chk_lam.isChecked():
                 bundle["models"]["lam"] = tr.fit_curve_final(long_df, self.feats, "lam", device)
                 self.log("λ 最终模型完成")
-            if self.chk_etamax.isChecked() and self.det.get("eta_max"):
-                bundle["models"]["eta_max"] = tr.fit_scalar_final(self.df, self.feats, self.det["eta_max"], device)
-                self.log("η_max 最终模型完成")
-            if self.chk_phiat.isChecked() and self.det.get("phi_at_etamax"):
-                bundle["models"]["phi_at"] = tr.fit_scalar_final(self.df, self.feats, self.det["phi_at_etamax"], device)
-                self.log("φ_at_ηmax 最终模型完成")
+            if self.chk_etamax.isChecked() or self.chk_phiat.isChecked():
+                bundle["scalar_from_curve"] = True
+                self.log("注：η_max / φ_at_ηmax 由预测 η 曲线求峰得到，无需单独保存标量模型。")
             joblib.dump(bundle, path)
             self.log("最终模型已保存：%s" % path)
         except Exception:
